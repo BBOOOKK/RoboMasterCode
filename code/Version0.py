@@ -155,7 +155,7 @@ def draw_overlay(roi_color, data, ww, info_text):
 
 def main():
     ep = robot.Robot()
-    ep.initialize(conn_type='sta')
+    ep.initialize(conn_type='ap')
 
     gimbal = ep.gimbal
     chassis = ep.chassis
