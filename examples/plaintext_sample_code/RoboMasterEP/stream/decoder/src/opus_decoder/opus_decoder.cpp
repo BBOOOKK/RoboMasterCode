@@ -1,5 +1,6 @@
 #include "opus_decoder.h"
 #include <pybind11/pybind11.h>
+#include <Python.h>
 namespace py = pybind11;
 PYBIND11_MODULE(opus_decoder, m) {
   m.doc()="opus_decoder for pybind11 plugin";
