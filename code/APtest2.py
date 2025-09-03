@@ -1,23 +1,18 @@
 from robomaster import robot
-import time
 
 if __name__ == '__main__':
-    # 连接机器人（根据连接方式修改IP）
-    # 无线热点模式默认IP: 192.168.10.2
-    # 有线连接默认IP: 192.168.2.1
-    ep = robot.Robot(ip="192.168.10.2")
-    
-    # 初始化
-    ep.initialize()
-    
-    # 测试云台（如果有）
-    ep.gimbal.recenter().wait_for_completion()
-    time.sleep(1)
-    
-    # 获取电池信息
-    battery_info = ep.battery.get_battery_info()
-    print(f"电池信息: {battery_info}")
-    
-    # 关闭连接
-    ep.close()
-    print("连接已关闭")
+    # 初始化机器人（AP模式）
+    ep_robot = robot.Robot()
+    try:
+        # 尝试连接，增加超时参数（可选）
+        ep_robot.initialize(conn_type='ap', timeout=10)
+        print("机器人连接成功！")
+        
+        # 测试：让机器人发出声音
+        ep_robot.play_sound(sound=1)
+        
+    except Exception as e:
+        print(f"连接失败：{e}")
+    finally:
+        # 断开连接
+        ep_robot.close()
