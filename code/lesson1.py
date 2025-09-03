@@ -27,6 +27,6 @@ if __name__ == '__main__':
                 time.sleep(0.2)
                 ep_led.set_led(comp = led.COMP_ALL, r=255, g=0, b=0, effect = led.EFFECT_OFF)
                 time.sleep(0.2)
-                
+
     ep_robot.close()
 
