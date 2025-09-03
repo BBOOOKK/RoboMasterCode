@@ -4,8 +4,7 @@ from robomaster import robot
 import time
 
 def main():
-    # 配置本地IP（如果自动获取失败，手动指定）
-    # robomaster.config.LOCAL_IP_STR = "192.168.2.20"  # 替换为你的电脑IP
+
 
     # 初始化机器人（AP直连模式）
     ep_robot = robot.Robot()
