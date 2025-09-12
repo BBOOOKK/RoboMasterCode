@@ -5,7 +5,7 @@ from robomaster import camera
 import time
 
 
-# 增强版PID控制器类
+# PID控制
 class EnhancedPID:
     def __init__(self, p=0.75, i=0.09, d=0.05, out_limit=80, integral_limit=50):
         self.kp = p
@@ -61,16 +61,12 @@ class EnhancedPID:
 
 
 def calculate_curvature(x_centers, y_rows):
-    """
-    x_centers: list[float]  成功检测到的各ROI行中心x（像素）
-    y_rows:    list[float]  与x_centers一一对应的y（像素）
-    返回：曲率代理（斜率缩放），>0右转、<0左转；不足2点或退化情况返回0
-    """
+
     # 基本校验
     if not x_centers or not y_rows:
         return 0.0
     if len(x_centers) != len(y_rows):
-        # 防御式处理（正常不会触发，因为我们会成对收集）
+        # 防御式处理（防止曲率收集错误）
         n = min(len(x_centers), len(y_rows))
         x_centers = x_centers[:n]
         y_rows    = y_rows[:n]
