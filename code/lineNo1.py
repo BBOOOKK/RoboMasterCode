@@ -226,7 +226,7 @@ try:
                 base_speed = 0.58
             else:  # 正常情况
                 z_speed = main_pid.update(0, error)
-                base_speed = 0.82
+                base_speed = 0.9
 
             # 根据偏差大小调整前进速度
             #speed_reduction = min(abs(error) / 100.0, 0.1)  # 偏差越大，速度越慢
