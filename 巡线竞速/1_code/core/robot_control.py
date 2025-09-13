@@ -33,8 +33,8 @@ class LineFollowerConfig:
     preemptive_slowdown_factor: float = 0.7  # 提前降速系数
     
     # PID 控制器设置 - 超激进弯道控制
-    main_pid_params: Tuple[float, float, float, float] = (0.5, 0.0006, 0.15, 130)     # 进一步提高响应
-    curved_pid_params: Tuple[float, float, float, float] = (2.5, 0.001, 0.45, 265)    # 极强弯道控制，防止转出
+    main_pid_params: Tuple[float, float, float, float] = (0.5, 0.00070, 0.152, 130)     # 进一步提高响应
+    curved_pid_params: Tuple[float, float, float, float] = (2.5, 0.001, 0.45, 265)    # 极强弯道控制，防止转出 #2.5
     
     # 云台设置
     gimbal_pitch: float = -25.0
@@ -50,9 +50,10 @@ class LineFollowerConfig:
     position_history_length: int = 8
     curvature_history_length: int = 5
     
+    
     # 速度设置 - 微调协调性
-    base_speed_straight: float = 1.0         # 微调直线速度，提升协调性
-    base_speed_curve: float = 0.3            # 微调弯道速度，提升过弯协调性
+    base_speed_straight: float = 1.328         # 微调直线速度，提升协调性 #1.32
+    base_speed_curve: float = 0.4            # 微调弯道速度，提升过弯协调性 
     
     # 曲率阈值设置 - 大幅降低阈值，更敏感检测弯道
     curvature_enter_threshold: float = 0.08   # 大幅降低阈值，极早检测弯道
@@ -61,12 +62,24 @@ class LineFollowerConfig:
     # 历史数据设置 - 减少平滑，提高响应速度
     position_history_length: int = 5          # 减少历史数据点数
     curvature_history_length: int = 3         # 减少曲率历史点数
+    
+    # # 速度设置 - 微调协调性
+    # base_speed_straight: float = 1.3         # 微调直线速度，提升协调性 
+    # base_speed_curve: float = 0.4            # 微调弯道速度，提升过弯协调性 
+    
+    # # 曲率阈值设置 - 大幅降低阈值，更敏感检测弯道
+    # curvature_enter_threshold: float = 0.08   # 大幅降低阈值，极早检测弯道
+    # curvature_exit_threshold: float = 0.05    # 大幅降低退出阈值，保持弯道模式
+    
+    # # 历史数据设置 - 减少平滑，提高响应速度
+    # position_history_length: int = 5          # 减少历史数据点数
+    # curvature_history_length: int = 3         # 减少曲率历史点数
 
 
 class EnhancedPID:
     """增强型PID控制器，带积分限制和输出钳位"""
     
-    def __init__(self, p: float = 0.75, i: float = 0.09, d: float = 0.05, 
+    def __init__(self, p: float = 0.73, i: float = 0.115, d: float = 0.05, #i120
                  out_limit: float = 80, integral_limit: float = 50):
         """
         初始化PID控制器
