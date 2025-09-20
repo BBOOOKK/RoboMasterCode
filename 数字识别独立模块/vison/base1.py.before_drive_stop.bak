@@ -1,0 +1,359 @@
+﻿import cv2
+import time
+import os
+from datetime import datetime
+from robomaster import robot
+
+# 配置常量
+IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 720
+TARGET_NUMBERS = {"1", "2", "3", "4", "5"}
+YELLOW_COLOR = (0, 255, 255)  # BGR
+BLACK_COLOR = (0, 0, 0)
+GREEN_COLOR = (0, 255, 0)
+
+# 相机视场角（度），可按实际设备调整
+H_FOV_DEG = 60.0
+V_FOV_DEG = 45.0
+
+# 判定“居中”的阈值（归一化坐标偏差）
+CENTER_THRESH = 0.05
+# 目标丢失超时（秒）
+CENTER_TIMEOUT_S = 2.0
+# 单步控制增益（将像面误差映射到角度的比例）
+STEP_GAIN = 0.6
+# 每步最大角度，防止过冲
+MAX_YAW_STEP_DEG = 10.0
+MAX_PITCH_STEP_DEG = 8.0
+# 小于该角度则认为太小，给一个最小步长帮助克服静摩擦
+MIN_STEP_DEG = 1.0
+# 下发云台命令的最小时间间隔（秒），避免过快导致抖动
+RATE_LIMIT_S = 0.08
+# 误差指数平滑系数（0~1，越大越信任当前帧，越小越平滑）
+EMA_ALPHA = 0.6
+# 判定“稳定居中”所需连续帧数
+CENTER_STABLE_FRAMES = 2
+
+# 方向符号（根据坐标系可能需要翻转）。
+# 默认值（-1, -1）通常满足“目标在右侧 -> 正向偏航为负”的情形。
+SIGN_YAW = -1.0
+SIGN_PITCH = -1.0
+
+# 全局状态
+markers = []                  # 当前帧的标记框列表
+recognized_numbers = set()    # 已识别过的数字
+total_saves = 0               # 保存次数
+
+# 跟踪状态
+gimbal_moving = False         # 是否正在跟踪一个目标
+target_number = None          # 当前跟踪的数字
+centering_started_at = 0.0    # 本次跟踪开始时间（用于丢失超时）
+
+# 控制与自适应相关状态
+last_err_x = None
+last_err_y = None
+ema_err_x = None
+ema_err_y = None
+last_move_time = 0.0
+adapt_cooldown_until = 0.0
+yaw_flip_done = False
+pitch_flip_done = False
+stable_center_count = 0
+
+
+def _to_str(info):
+    """将 SDK 回调里的 info 统一转成字符串。"""
+    if isinstance(info, (bytes, bytearray)):
+        try:
+            return info.decode("utf-8", errors="ignore")
+        except Exception:
+            return str(info)
+    return str(info)
+
+
+def on_detect_marker(marker_info):
+    """视觉回调：更新标记列表，并在空闲时选择一个新的跟踪目标。"""
+    global markers, recognized_numbers, target_number, gimbal_moving
+    global centering_started_at, last_err_x, last_err_y, ema_err_x, ema_err_y
+    global yaw_flip_done, pitch_flip_done, stable_center_count
+
+    if not marker_info:
+        markers.clear()
+        return
+
+    markers.clear()
+    detected = []              # [(num, x, y)]
+    new_in_frame = set()       # 本帧新出现的数字
+
+    for i in range(len(marker_info)):
+        x, y, w, h, info = marker_info[i]
+        info_str = _to_str(info)
+        markers.append(MarkerInfo(x, y, w, h, info_str))
+        if info_str in TARGET_NUMBERS:
+            num = int(info_str)
+            detected.append((num, x, y))
+            if num not in recognized_numbers:
+                recognized_numbers.add(num)
+                new_in_frame.add(num)
+                print(f"识别到新数字: {num}")
+
+    # 空闲时选择目标：优先本帧新数字；否则选最居中
+    if detected and not gimbal_moving:
+        candidates = [t for t in detected if t[0] in new_in_frame] or detected
+        target_num, tx, ty = min(candidates, key=lambda it: abs(it[1] - 0.5) + abs(it[2] - 0.5))
+        target_number = target_num
+        gimbal_moving = True
+        centering_started_at = time.time()
+        # 重置控制状态，避免上一次残留影响本次
+        last_err_x = last_err_y = None
+        ema_err_x = ema_err_y = None
+        yaw_flip_done = pitch_flip_done = False
+        stable_center_count = 0
+        print(f"开始跟踪数字 {target_number}，初始位置=({tx:.2f}, {ty:.2f})")
+
+
+def save_number_image(img, number):
+    """保存一张带标注的图像到 recognized_numbers 目录。"""
+    try:
+        os.makedirs("recognized_numbers", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn = f"recognized_numbers/number_{number}_{ts}.jpg"
+        cv2.imwrite(fn, img)
+        print(f"已保存图片: {fn}")
+        return fn
+    except Exception as e:
+        print(f"保存图片出错: {e}")
+        return None
+
+
+class MarkerInfo:
+    """为每个识别到的标记提供像素绘制与文本属性。"""
+    def __init__(self, x, y, w, h, info):
+        self._x = x
+        self._y = y
+        self._w = w
+        self._h = h
+        self._info = info
+
+    @property
+    def pt1(self):
+        return int((self._x - self._w / 2) * IMAGE_WIDTH), int((self._y - self._h / 2) * IMAGE_HEIGHT)
+
+    @property
+    def pt2(self):
+        return int((self._x + self._w / 2) * IMAGE_WIDTH), int((self._y + self._h / 2) * IMAGE_HEIGHT)
+
+    @property
+    def center(self):
+        return int(self._x * IMAGE_WIDTH), int(self._y * IMAGE_HEIGHT)
+
+    @property
+    def text(self):
+        return self._info
+
+
+def draw_annotations(image, markers_list):
+    """在图像上绘制框和标签。"""
+    for m in markers_list:
+        box_color = GREEN_COLOR if str(target_number) == m.text else YELLOW_COLOR
+        cv2.rectangle(image, m.pt1, m.pt2, box_color, 3)
+        label = f"Number: {m.text}"
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = m.center[0] - text_size[0] // 2
+        text_y = m.pt1[1] - 10 if m.pt1[1] > 30 else m.pt2[1] + 30
+        cv2.rectangle(image, (text_x - 5, text_y - text_size[1] - 5), (text_x + text_size[0] + 5, text_y + 5), box_color, -1)
+        cv2.putText(image, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, BLACK_COLOR, 2)
+        if m.text in [str(n) for n in recognized_numbers]:
+            cv2.putText(image, "[已识别]", (text_x - 60, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, BLACK_COLOR, 2)
+    return image
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def move_gimbal_to_target(ep_gimbal, target_x, target_y):
+    """向目标中心移动一步。加入限幅、平滑与一次性符号自校准。
+    返回 True 表示已连续若干帧居中，可进行拍照。"""
+    global gimbal_moving, last_err_x, last_err_y, ema_err_x, ema_err_y
+    global last_move_time, adapt_cooldown_until, yaw_flip_done, pitch_flip_done
+    global stable_center_count
+
+    # 当前帧归一化误差（-0.5~0.5）
+    err_x = target_x - 0.5
+    err_y = target_y - 0.5
+
+    # 指数平滑，降低抖动
+    if ema_err_x is None:
+        ema_err_x = err_x
+        ema_err_y = err_y
+    else:
+        ema_err_x = EMA_ALPHA * err_x + (1.0 - EMA_ALPHA) * ema_err_x
+        ema_err_y = EMA_ALPHA * err_y + (1.0 - EMA_ALPHA) * ema_err_y
+
+    # 是否已经“近似居中”（即时判断，用于计数稳定帧）
+    instant_centered = (abs(err_x) < CENTER_THRESH) and (abs(err_y) < CENTER_THRESH)
+    if instant_centered:
+        stable_center_count += 1
+    else:
+        stable_center_count = 0
+
+    # 丢失或已足够稳定则无需再动
+    if stable_center_count >= CENTER_STABLE_FRAMES:
+        return True
+
+    # 方向自校准（最多各轴翻转一次）：
+    # 若上一次移动后误差变大很多（>25% 且 >0.12），认为方向相反，翻转一次并冷却一段时间。
+    now = time.time()
+    if last_err_x is not None and now > adapt_cooldown_until:
+        try:
+            if (not yaw_flip_done) and (abs(err_x) > abs(last_err_x) * 1.25) and (abs(err_x) > 0.12):
+                globals()['SIGN_YAW'] = -SIGN_YAW
+                yaw_flip_done = True
+                adapt_cooldown_until = now + 0.8
+                print(f"已翻转偏航方向符号，当前 SIGN_YAW={SIGN_YAW:+.0f}")
+            if (not pitch_flip_done) and (abs(err_y) > abs(last_err_y) * 1.25) and (abs(err_y) > 0.12):
+                globals()['SIGN_PITCH'] = -SIGN_PITCH
+                pitch_flip_done = True
+                adapt_cooldown_until = now + 0.8
+                print(f"已翻转俯仰方向符号，当前 SIGN_PITCH={SIGN_PITCH:+.0f}")
+        except Exception:
+            pass
+
+    # 将误差映射为角度步长，并做限幅 + 最小步长
+    yaw_step = SIGN_YAW * ema_err_x * (H_FOV_DEG / 2.0) * STEP_GAIN
+    pitch_step = SIGN_PITCH * ema_err_y * (V_FOV_DEG / 2.0) * STEP_GAIN
+
+    yaw_step = _clamp(yaw_step, -MAX_YAW_STEP_DEG, MAX_YAW_STEP_DEG)
+    pitch_step = _clamp(pitch_step, -MAX_PITCH_STEP_DEG, MAX_PITCH_STEP_DEG)
+
+    if abs(yaw_step) < MIN_STEP_DEG and abs(err_x) > CENTER_THRESH:
+        yaw_step = MIN_STEP_DEG if yaw_step >= 0 else -MIN_STEP_DEG
+    if abs(pitch_step) < MIN_STEP_DEG and abs(err_y) > CENTER_THRESH:
+        pitch_step = MIN_STEP_DEG if pitch_step >= 0 else -MIN_STEP_DEG
+
+    # 速率限制：过快下发会造成抖动
+    if now - last_move_time < RATE_LIMIT_S:
+        last_err_x = err_x
+        last_err_y = err_y
+        return False
+
+    try:
+        ep_gimbal.move(yaw=yaw_step, pitch=pitch_step).wait_for_completed()
+        last_move_time = now
+    except Exception as e:
+        gimbal_moving = False
+        print(f"云台移动出错: {e}")
+        return False
+
+    # 记录当前误差，供下轮自适应判断
+    last_err_x = err_x
+    last_err_y = err_y
+
+    return False
+
+
+if __name__ == '__main__':
+    # 初始化机器人
+    ep_robot = robot.Robot()
+    ep_robot.initialize(conn_type="ap")
+
+    ep_vision = ep_robot.vision
+    ep_camera = ep_robot.camera
+    ep_gimbal = ep_robot.gimbal
+
+    # 允许通过环境变量强制指定方向（YAW_SIGN/PITCH_SIGN ∈ {+1,-1}）
+    try:
+        _ys = os.environ.get('YAW_SIGN')
+        _ps = os.environ.get('PITCH_SIGN')
+        if _ys in ('1', '+1', '-1'):
+            globals()['SIGN_YAW'] = 1.0 if _ys.startswith('1') or _ys.startswith('+') else -1.0
+        if _ps in ('1', '+1', '-1'):
+            globals()['SIGN_PITCH'] = 1.0 if _ps.startswith('1') or _ps.startswith('+') else -1.0
+    except Exception:
+        pass
+
+    # 开启视频与标记识别回调
+    ep_camera.start_video_stream(display=False)
+    ep_vision.sub_detect_info(name="marker", callback=on_detect_marker)
+
+    # 云台回中，确保起点一致
+    ep_gimbal.recenter().wait_for_completed()
+
+    print("数字识别与云台跟踪程序启动")
+    print("目标数字：1,2,3,4,5 ；按 q 退出")
+
+    try:
+        while True:
+            img = ep_camera.read_cv2_image(strategy="newest", timeout=0.5)
+            if img is None:
+                continue
+
+            # 使用快照，避免回调并发修改
+            local_markers = list(markers)
+
+            if gimbal_moving and target_number is not None:
+                # 查找当前目标对应的标记
+                target_marker = None
+                for m in local_markers:
+                    if m.text == str(target_number):
+                        target_marker = m
+                        break
+
+                # 目标暂时不见且超时 -> 取消跟踪并回中
+                if target_marker is None:
+                    if time.time() - centering_started_at > CENTER_TIMEOUT_S:
+                        print(f"目标 {target_number} 丢失，取消本次跟踪")
+                        gimbal_moving = False
+                        target_number = None
+                        try:
+                            ep_gimbal.recenter().wait_for_completed()
+                        except Exception:
+                            pass
+                else:
+                    # 朝目标移动；若连续稳定居中则拍照并回中
+                    if move_gimbal_to_target(ep_gimbal, target_marker._x, target_marker._y):
+                        annotated = img.copy()
+                        annotated = draw_annotations(annotated, local_markers)
+                        fn = save_number_image(annotated, target_number)
+                        if fn:
+                            total_saves += 1
+                            print(f"已拍照并保存：数字 {target_number}")
+                        try:
+                            ep_gimbal.recenter().wait_for_completed()
+                        except Exception:
+                            pass
+                        gimbal_moving = False
+                        target_number = None
+
+            # 叠加 HUD
+            display_img = img.copy()
+            display_img = draw_annotations(display_img, local_markers)
+            stats_text = f"已识别: {sorted(recognized_numbers)} | 已保存: {total_saves}"
+            cv2.putText(display_img, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_COLOR, 2)
+
+            cv2.imshow("数字识别与云台跟踪", display_img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("退出程序")
+                break
+
+    except KeyboardInterrupt:
+        print("用户中断程序")
+    except Exception as e:
+        print(f"运行时异常: {e}")
+    finally:
+        print("开始清理资源...")
+        try:
+            ep_vision.unsub_detect_info(name="marker")
+        except Exception:
+            pass
+        try:
+            ep_camera.stop_video_stream()
+        except Exception:
+            pass
+        try:
+            ep_robot.close()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+        print("清理完成")

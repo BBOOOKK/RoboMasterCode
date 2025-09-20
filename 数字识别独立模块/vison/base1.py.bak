@@ -1,0 +1,279 @@
+import cv2
+import time
+import os
+import numpy as np
+from datetime import datetime
+from robomaster import robot, vision, gimbal
+
+# Configuration constants
+IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 720
+TARGET_NUMBERS = {'1', '2', '3', '4', '5'}
+YELLOW_COLOR = (0, 255, 255)  # BGR format
+BLACK_COLOR = (0, 0, 0)
+GREEN_COLOR = (0, 255, 0)
+
+class MarkerInfo:
+    def __init__(self, x, y, w, h, info):
+        self._x = x
+        self._y = y
+        self._w = w
+        self._h = h
+        self._info = info
+
+    @property
+    def pt1(self):
+        return int((self._x - self._w / 2) * IMAGE_WIDTH), int((self._y - self._h / 2) * IMAGE_HEIGHT)
+
+    @property
+    def pt2(self):
+        return int((self._x + self._w / 2) * IMAGE_WIDTH), int((self._y + self._h / 2) * IMAGE_HEIGHT)
+
+    @property
+    def center(self):
+        return int(self._x * IMAGE_WIDTH), int(self._y * IMAGE_HEIGHT)
+
+    @property
+    def text(self):
+        return self._info
+
+# Global state
+markers = []
+recognized_numbers = set()
+numbers_to_save = set()
+total_saves = 0
+gimbal_moving = False
+target_number = None
+
+# ===== 新增：拍照会话相关全局变量 =====
+photo_session_active = False      # 是否正在进行“依次拍 1~5”的会话
+scan_queue = []                   # 本次会话要拍的数字队列（只含当前画面里真的出现的）
+newly_recognized_in_frame = []    # 本帧新识别到的数字（用于触发会话，避免反复触发）
+target_deadline = 0.0             # 当前目标的超时截止（找不到就跳过）
+
+def on_detect_marker(marker_info):
+    """Callback function for marker detection"""
+    global markers, recognized_numbers, numbers_to_save, target_number, gimbal_moving
+    # ===== 新增：需要读取拍照会话开关，避免与会话抢云台 =====
+    global photo_session_active, newly_recognized_in_frame
+
+    markers.clear()
+    detected_numbers = []
+    newly_recognized_in_frame.clear()  # 每次回调刷新
+
+    for i in range(len(marker_info)):
+        x, y, w, h, info = marker_info[i]
+        markers.append(MarkerInfo(x, y, w, h, info))
+
+        # Process target numbers
+        if info in TARGET_NUMBERS:
+            num = int(info)
+            detected_numbers.append((num, x, y))
+
+            if num not in recognized_numbers:
+                recognized_numbers.add(num)
+                numbers_to_save.add(num)
+                newly_recognized_in_frame.append(num)   # ===== 新增：记录“新出现”的数字
+                print(f"✅ Recognized new number: {num}")
+
+    # Auto-select target for gimbal tracking（不在拍照会话时才自动挑目标）
+    if detected_numbers and (not gimbal_moving) and (not photo_session_active):
+        # 找最居中的
+        best_target = min(detected_numbers, key=lambda item: abs(item[1] - 0.5) + abs(item[2] - 0.5))
+        target_num, target_x, target_y = best_target
+        # 设为当前自动跟踪目标
+        target_number = target_num
+        gimbal_moving = True
+        print(f"🎯 Gimbal targeting number {target_number} at position ({target_x:.2f}, {target_y:.2f})")
+
+def save_number_image(img, number):
+    """Save annotated image with recognized number"""
+    try:
+        os.makedirs("recognized_numbers", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recognized_numbers/number_{number}_{timestamp}.jpg"
+        cv2.imwrite(filename, img)
+        print(f"💾 Saved annotated image: {filename}")
+        return filename
+    except Exception as e:
+        print(f"❌ Error saving image: {e}")
+        return None
+
+def draw_annotations(image, markers_list):
+    """Draw annotations on the image"""
+    for marker in markers_list:
+        box_color = GREEN_COLOR if str(target_number) == marker.text else YELLOW_COLOR
+        cv2.rectangle(image, marker.pt1, marker.pt2, box_color, 3)
+
+        label = f"Number: {marker.text}"
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = marker.center[0] - text_size[0] // 2
+        text_y = marker.pt1[1] - 10 if marker.pt1[1] > 30 else marker.pt2[1] + 30
+
+        cv2.rectangle(image, (text_x - 5, text_y - text_size[1] - 5),
+                      (text_x + text_size[0] + 5, text_y + 5), box_color, -1)
+        cv2.putText(image, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, BLACK_COLOR, 2)
+
+        if marker.text in [str(n) for n in recognized_numbers]:
+            marker_size = 12
+            marker_x = text_x - marker_size - 8
+            marker_y = text_y
+            cv2.putText(image, "✓", (marker_x, marker_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, BLACK_COLOR, 2)
+
+    return image
+
+def move_gimbal_to_target(ep_gimbal, target_x, target_y):
+    """Move gimbal to center the target in the view"""
+    global gimbal_moving
+
+    x_offset = target_x - 0.5
+    y_offset = target_y - 0.5
+
+    # 视场角近似（水平60°、垂直45°），把像面偏差转成角度微调
+    yaw_offset = -x_offset * 30.0
+    pitch_offset = -y_offset * 22.5
+
+    ep_gimbal.move(yaw=yaw_offset, pitch=pitch_offset).wait_for_completed()
+
+    if abs(x_offset) < 0.1 and abs(y_offset) < 0.1:
+        gimbal_moving = False
+        print(f"🎯 Number {target_number} centered by gimbal movement")
+        return True
+    return False
+
+# ===== 新增：底盘暂停/恢复（不破坏你原有行驶逻辑，只在会话时发“停”）=====
+def pause_chassis(ep_robot):
+    ch = getattr(ep_robot, 'chassis', None)
+    if ch is None:
+        return
+    try:
+        # 连续速度控制：置零
+        ch.drive_speed(x=0, y=0, z=0)
+    except Exception:
+        pass
+    try:
+        # 若在执行 move 任务，发送 stop
+        ch.stop()
+    except Exception:
+        pass
+
+if __name__ == '__main__':
+    # Initialize RoboMaster robot
+    ep_robot = robot.Robot()
+    ep_robot.initialize(conn_type="ap")
+
+    ep_vision = ep_robot.vision
+    ep_camera = ep_robot.camera
+    ep_gimbal = ep_robot.gimbal
+    ep_chassis = ep_robot.chassis  # ===== 新增：拿到底盘句柄（用于暂停）
+
+    # Start video stream and marker detection
+    ep_camera.start_video_stream(display=False)
+    ep_vision.sub_detect_info(name="marker", callback=on_detect_marker)
+
+    # Set gimbal mode and recenter
+    ep_gimbal.recenter().wait_for_completed()
+
+    print("🚀 Number recognition system started")
+    print("📋 Target numbers: 1, 2, 3, 4, 5")
+    print("📷 Gimbal auto-tracking enabled")
+    print("⏹️  Press 'q' to quit")
+
+    time.sleep(1)
+
+    try:
+        while True:
+            img = ep_camera.read_cv2_image(strategy="newest", timeout=0.5)
+            if img is None:
+                continue
+
+            # ===== 新增：若本帧出现了新的 1~5，触发一次“拍照会话” =====
+            if (not photo_session_active) and newly_recognized_in_frame:
+                # 只取当前画面里实际出现的 1~5，按数字顺序排队
+                present = sorted({int(m.text) for m in markers if m.text in TARGET_NUMBERS})
+                if present:
+                    pause_chassis(ep_robot)     # 先让车停
+                    photo_session_active = True
+                    scan_queue = present.copy()
+                    print(f"📷 Photo session started. Queue = {scan_queue}")
+                newly_recognized_in_frame.clear()
+
+            # ===== 新增：会话状态机——依次把云台对准队列中的数字并拍照 =====
+            if photo_session_active:
+                # 若当前没有在动云台，安排下一个目标
+                if not gimbal_moving:
+                    if target_number is not None:
+                        # 上一个目标已完成对中与拍照
+                        target_number = None
+                    if scan_queue:
+                        next_num = scan_queue.pop(0)
+                        target_number = next_num
+                        gimbal_moving = True
+                        target_deadline = time.time() + 2.0  # 单个目标最多等2秒（防止目标突然消失卡死）
+                        print(f"➡️  Scanning number {next_num} ...")
+                    else:
+                        # 队列空：会话结束，云台回正
+                        ep_gimbal.recenter().wait_for_completed()
+                        photo_session_active = False
+                        print("✅ Photo session finished. Resume driving by your control loop.")
+                else:
+                    # 正在等待原有分支完成对中与拍照；如果目标不在画面里且超时，则跳过
+                    target_exists = any(m.text == str(target_number) for m in markers)
+                    if (not target_exists) and (time.time() > target_deadline):
+                        print(f"⏭️  Number {target_number} missing, skip.")
+                        gimbal_moving = False  # 跳过本目标，去安排下一个
+
+            # ===== 原有：自动跟随与拍照（保持不动）=====
+            if gimbal_moving and target_number is not None:
+                target_marker = None
+                for marker in markers:
+                    if marker.text == str(target_number):
+                        target_marker = marker
+                        break
+
+                if target_marker:
+                    norm_x = target_marker._x
+                    norm_y = target_marker._y
+
+                    if move_gimbal_to_target(ep_gimbal, norm_x, norm_y):
+                        annotated_img = img.copy()
+                        annotated_img = draw_annotations(annotated_img, markers)
+                        filename = save_number_image(annotated_img, target_number)
+                        if filename:
+                            total_saves += 1
+                            print(f"📸 Gimbal centered and saved number {target_number}")
+
+            # 原有：其它已识别数字的“非跟踪保存”
+            if numbers_to_save:
+                for num in list(numbers_to_save):
+                    if num != target_number:  # 避免重复保存正在跟踪的这个
+                        annotated_img = img.copy()
+                        annotated_img = draw_annotations(annotated_img, markers)
+                        filename = save_number_image(annotated_img, num)
+                        if filename:
+                            total_saves += 1
+                            print(f"📸 Saved number {num}")
+                numbers_to_save.clear()
+
+            # 叠加显示
+            display_img = img.copy()
+            display_img = draw_annotations(display_img, markers)
+            stats_text = f"Recognized: {sorted(recognized_numbers)} | Saves: {total_saves}"
+            cv2.putText(display_img, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_COLOR, 2)
+            cv2.imshow("Number Recognition System", display_img)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("🛑 Stopping recognition system...")
+                break
+
+    except KeyboardInterrupt:
+        print("🛑 Program interrupted by user")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+    finally:
+        print("🧹 Cleaning up resources...")
+        ep_vision.unsub_detect_info(name="marker")
+        ep_camera.stop_video_stream()
+        ep_robot.close()
+        cv2.destroyAllWindows()
+        print("✅ Cleanup completed")

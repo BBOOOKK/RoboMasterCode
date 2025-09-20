@@ -1,0 +1,243 @@
+﻿import cv2
+import time
+import os
+from datetime import datetime
+from robomaster import robot
+
+# Configuration constants
+IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 720
+TARGET_NUMBERS = {"1", "2", "3", "4", "5"}
+YELLOW_COLOR = (0, 255, 255)  # BGR
+BLACK_COLOR = (0, 0, 0)
+GREEN_COLOR = (0, 255, 0)  
+
+# Camera field of view assumptions (degrees)
+H_FOV_DEG = 60.0
+V_FOV_DEG = 45.0
+CENTER_THRESH = 0.06  # normalized threshold to consider centered
+CENTER_TIMEOUT_S = 2.0  # timeout if target disappears
+
+class MarkerInfo:
+    def __init__(self, x, y, w, h, info):
+        self._x = x
+        self._y = y
+        self._w = w
+        self._h = h
+        self._info = info
+
+    @property
+    def pt1(self):
+        return int((self._x - self._w / 2) * IMAGE_WIDTH), int((self._y - self._h / 2) * IMAGE_HEIGHT)
+
+    @property
+    def pt2(self):
+        return int((self._x + self._w / 2) * IMAGE_WIDTH), int((self._y + self._h / 2) * IMAGE_HEIGHT)
+
+    @property
+    def center(self):
+        return int(self._x * IMAGE_WIDTH), int(self._y * IMAGE_HEIGHT)
+
+    @property
+    def text(self):
+        return self._info
+
+# Global state
+markers = []
+recognized_numbers = set()
+total_saves = 0
+gimbal_moving = False
+target_number = None
+centering_started_at = 0.0
+
+
+def _to_str(info):
+    if isinstance(info, (bytes, bytearray)):
+        try:
+            return info.decode("utf-8", errors="ignore")
+        except Exception:
+            return str(info)
+    return str(info)
+
+
+def on_detect_marker(marker_info):
+    """Vision callback from SDK: updates global markers and selects a target."""
+    global markers, recognized_numbers, target_number, gimbal_moving, centering_started_at
+
+    if not marker_info:
+        markers.clear()
+        return
+
+    markers.clear()
+    detected = []  # list of (num, x, y)
+    new_in_frame = set()
+
+    for i in range(len(marker_info)):
+        x, y, w, h, info = marker_info[i]
+        info_str = _to_str(info)
+        markers.append(MarkerInfo(x, y, w, h, info_str))
+
+        if info_str in TARGET_NUMBERS:
+            num = int(info_str)
+            detected.append((num, x, y))
+            if num not in recognized_numbers:
+                recognized_numbers.add(num)
+                new_in_frame.add(num)
+                print(f"✅ Recognized new number: {num}")
+
+    # Choose a target if idle
+    if detected and not gimbal_moving:
+        # Priority: new numbers in this frame; else most centered
+        candidates = [t for t in detected if t[0] in new_in_frame] or detected
+        target_num, tx, ty = min(candidates, key=lambda it: abs(it[1] - 0.5) + abs(it[2] - 0.5))
+        target_number = target_num
+        gimbal_moving = True
+        centering_started_at = time.time()
+        print(f"🎯 Start tracking number {target_number} at ({tx:.2f}, {ty:.2f})")
+
+
+def save_number_image(img, number):
+    try:
+        os.makedirs("recognized_numbers", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn = f"recognized_numbers/number_{number}_{ts}.jpg"
+        cv2.imwrite(fn, img)
+        print(f"💾 Saved annotated image: {fn}")
+        return fn
+    except Exception as e:
+        print(f"❌ Error saving image: {e}")
+        return None
+
+
+def draw_annotations(image, markers_list):
+    for m in markers_list:
+        box_color = GREEN_COLOR if str(target_number) == m.text else YELLOW_COLOR
+        cv2.rectangle(image, m.pt1, m.pt2, box_color, 3)
+        label = f"Number: {m.text}"
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = m.center[0] - text_size[0] // 2
+        text_y = m.pt1[1] - 10 if m.pt1[1] > 30 else m.pt2[1] + 30
+        cv2.rectangle(image, (text_x - 5, text_y - text_size[1] - 5), (text_x + text_size[0] + 5, text_y + 5), box_color, -1)
+        cv2.putText(image, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, BLACK_COLOR, 2)
+        if m.text in [str(n) for n in recognized_numbers]:
+            cv2.putText(image, "✓", (text_x - 20, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, BLACK_COLOR, 2)
+    return image
+
+
+def move_gimbal_to_target(ep_gimbal, target_x, target_y):
+    """Issue a relative move step toward target center. Return True if centered."""
+    global gimbal_moving
+
+    x_offset = target_x - 0.5
+    y_offset = target_y - 0.5
+
+    yaw_offset = -x_offset * (H_FOV_DEG / 2.0)
+    pitch_offset = -y_offset * (V_FOV_DEG / 2.0)
+
+    try:
+        ep_gimbal.move(yaw=yaw_offset, pitch=pitch_offset).wait_for_completed()
+    except Exception as e:
+        gimbal_moving = False
+        print(f"❌ Gimbal move error: {e}")
+        return False
+
+    return (abs(x_offset) < CENTER_THRESH) and (abs(y_offset) < CENTER_THRESH)
+
+
+if __name__ == '__main__':
+    # Initialize RoboMaster robot
+    ep_robot = robot.Robot()
+    ep_robot.initialize(conn_type="ap")
+
+    ep_vision = ep_robot.vision
+    ep_camera = ep_robot.camera
+    ep_gimbal = ep_robot.gimbal
+
+    # Start video stream and marker detection
+    ep_camera.start_video_stream(display=False)
+    ep_vision.sub_detect_info(name="marker", callback=on_detect_marker)
+
+    # Recenter gimbal to have a known reference
+    ep_gimbal.recenter().wait_for_completed()
+
+    print("🚀 Number recognition system started")
+    print("📋 Target numbers: 1, 2, 3, 4, 5")
+    print("📷 Gimbal auto-tracking enabled")
+    print("⏹️  Press 'q' to quit")
+
+    try:
+        while True:
+            img = ep_camera.read_cv2_image(strategy="newest", timeout=0.5)
+            if img is None:
+                continue
+
+            # Snapshot to avoid concurrent modification
+            local_markers = list(markers)
+
+            if gimbal_moving and target_number is not None:
+                # Find the current target marker
+                target_marker = None
+                for m in local_markers:
+                    if m.text == str(target_number):
+                        target_marker = m
+                        break
+
+                # Timeout if target disappeared
+                if target_marker is None:
+                    if time.time() - centering_started_at > CENTER_TIMEOUT_S:
+                        print(f"⏭️  Target {target_number} lost, cancel.")
+                        gimbal_moving = False
+                        target_number = None
+                        # Return to center to be ready for the next target
+                        try:
+                            ep_gimbal.recenter().wait_for_completed()
+                        except Exception:
+                            pass
+                else:
+                    # Move toward target; if centered, take photo and recenter
+                    if move_gimbal_to_target(ep_gimbal, target_marker._x, target_marker._y):
+                        annotated = img.copy()
+                        annotated = draw_annotations(annotated, local_markers)
+                        fn = save_number_image(annotated, target_number)
+                        if fn:
+                            total_saves += 1
+                            print(f"📸 Gimbal centered and saved number {target_number}")
+                        # Return gimbal to center
+                        try:
+                            ep_gimbal.recenter().wait_for_completed()
+                        except Exception:
+                            pass
+                        gimbal_moving = False
+                        target_number = None
+
+            # Draw HUD
+            display_img = img.copy()
+            display_img = draw_annotations(display_img, local_markers)
+            stats_text = f"Recognized: {sorted(recognized_numbers)} | Saves: {total_saves}"
+            cv2.putText(display_img, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_COLOR, 2)
+
+            cv2.imshow("Number Recognition System", display_img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("🛑 Stopping recognition system...")
+                break
+
+    except KeyboardInterrupt:
+        print("🛑 Program interrupted by user")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+    finally:
+        print("🧹 Cleaning up resources...")
+        try:
+            ep_vision.unsub_detect_info(name="marker")
+        except Exception:
+            pass
+        try:
+            ep_camera.stop_video_stream()
+        except Exception:
+            pass
+        try:
+            ep_robot.close()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+        print("✅ Cleanup completed")
